@@ -12,10 +12,13 @@ int basic_test(size_t num_threads) {
     ThreadPoolOptions opt;
     opt.numInitialThreads = num_threads;
 
+    // Initialize thread pool.
     ThreadPoolMgr mgr;
     mgr.init(opt);
 
     std::mutex mm;
+
+    // Run 20 asynchronous tasks.
     for (size_t ii=0; ii<20; ++ii) {
         mgr.addTask( [ii, &mm](const TaskResult& ret) {
             std::lock_guard<std::mutex> l(mm);
@@ -24,10 +27,11 @@ int basic_test(size_t num_threads) {
         } );
     }
 
+    // Wait until all tasks are done.
     TestSuite::sleep_sec(1);
 
+    // Shutdown thread pool.
     mgr.shutdown();
-
     return 0;
 }
 
@@ -35,12 +39,15 @@ int recurring_test(size_t num_threads) {
     ThreadPoolOptions opt;
     opt.numInitialThreads = num_threads;
 
+    // Initialize thread pool.
     ThreadPoolMgr mgr;
     mgr.init(opt);
 
     TestSuite::_msgt("begin\n");
 
     size_t count = 0;
+
+    // Register a recurring timer whose interval is 100 ms.
     std::shared_ptr<TaskHandle> tt =
         mgr.addTask( [&count](const TaskResult& ret) {
                          TestSuite::_msgt("[%02zx] hello world %zu\n",
@@ -48,14 +55,18 @@ int recurring_test(size_t num_threads) {
                      },
                      100000,
                      TaskType::RECURRING );
+    // Wait 1 second, timer should be fired 10 times.
     TestSuite::sleep_sec(1);
+
+    // Cancel the timer.
     tt->cancel();
     TestSuite::_msgt("canceled timer\n");
 
+    // Wait another 1 second, now timer should be fired.
     TestSuite::sleep_sec(1);
 
+    // Shutdown thread pool.
     mgr.shutdown();
-
     return 0;
 }
 
@@ -63,6 +74,8 @@ void relay_func(size_t* count, ThreadPoolMgr* mgr, const TaskResult& ret) {
     TestSuite::_msgt("[%02zx] hello world %zu\n",
                      tid_simple(), (*count)++);
     if (*count < 10) {
+        // Register an one-time timer whose interval is 100 ms.
+        // Once the timer fires, it re-register itself up to 10 times.
         mgr->addTask( std::bind(relay_func,
                                 count,
                                 mgr,
@@ -75,17 +88,21 @@ int relay_test(size_t num_threads) {
     ThreadPoolOptions opt;
     opt.numInitialThreads = num_threads;
 
+    // Initialize thread pool.
     ThreadPoolMgr mgr;
     mgr.init(opt);
 
     TestSuite::_msgt("begin\n");
     size_t count = 0;
+
+    // Fire timer task.
     relay_func(&count, &mgr, TaskResult());
 
+    // Wait 2 seconds.
     TestSuite::sleep_sec(2);
 
+    // Shutdown thread pool.
     mgr.shutdown();
-
     return 0;
 }
 
@@ -93,25 +110,31 @@ int reschedule_one_time_test(size_t num_threads) {
     ThreadPoolOptions opt;
     opt.numInitialThreads = num_threads;
 
+    // Initialize thread pool.
     ThreadPoolMgr mgr;
     mgr.init(opt);
 
     TestSuite::_msgt("begin\n");
 
+    // Register a timer whose interval is 5 seconds.
     std::shared_ptr<TaskHandle> tt =
         mgr.addTask( [](const TaskResult& ret) {
                          TestSuite::_msgt("[%02zx] hello world\n",
                                           tid_simple());
                      },
                      5000000 );
+    // Wait 1 second, timer shouldn't be fired in the meantime.
     TestSuite::sleep_sec(1);
+
+    // Re-schedule the timer, now interval is 100 ms.
     tt->reschedule(100000);
     TestSuite::_msgt("rescheduled 5 sec -> 100 ms\n");
 
+    // Wait another 1 second, now timer should be fired.
     TestSuite::sleep_sec(1);
 
+    // Shutdown thread pool.
     mgr.shutdown();
-
     return 0;
 }
 
@@ -119,11 +142,13 @@ int reschedule_recurring_test(size_t num_threads) {
     ThreadPoolOptions opt;
     opt.numInitialThreads = num_threads;
 
+    // Initialize thread pool.
     ThreadPoolMgr mgr;
     mgr.init(opt);
 
     TestSuite::_msgt("begin\n");
 
+    // Register a recurring timer whose interval is 200 ms.
     size_t count = 0;
     std::shared_ptr<TaskHandle> tt =
         mgr.addTask( [&count](const TaskResult& ret) {
@@ -132,14 +157,18 @@ int reschedule_recurring_test(size_t num_threads) {
                      },
                      200000,
                      TaskType::RECURRING );
+    // Wait 1 second, timer should be fired 5 times.
     TestSuite::sleep_sec(1);
+
+    // Re-schedule the timer, now interval is 100 ms.
     tt->reschedule(100000);
     TestSuite::_msgt("rescheduled 200 ms -> 100 ms\n");
 
+    // Wait another 1 second, timer should be fired 10 times.
     TestSuite::sleep_sec(1);
 
+    // Shutdown thread pool.
     mgr.shutdown();
-
     return 0;
 }
 
@@ -147,29 +176,35 @@ int mixed_test(size_t num_threads) {
     ThreadPoolOptions opt;
     opt.numInitialThreads = num_threads;
 
+    // Initialize thread pool.
     ThreadPoolMgr mgr;
     mgr.init(opt);
 
     TestSuite::_msgt("begin\n");
 
+    // Recurring timer whose interval is 200 ms.
     mgr.addTask( [](const TaskResult& ret) {
                      TestSuite::_msgt("[%02zx] recurring 200 ms\n", tid_simple());
                  },
                  200000,
                  TaskType::RECURRING );
 
+    // Recurring timer whose interval is 300 ms.
     mgr.addTask( [](const TaskResult& ret) {
                      TestSuite::_msgt("[%02zx] recurring 300 ms\n", tid_simple());
                  },
                  300000,
                  TaskType::RECURRING );
 
+    // One-time timer whose interval is 500 ms.
     mgr.addTask( [](const TaskResult& ret) {
                      TestSuite::_msgt("[%02zx] one-time 500 ms\n", tid_simple());
                  },
                  500000 );
 
     std::mutex mm;
+
+    // 40 async tasks.
     for (size_t ii=0; ii<10; ++ii) {
         for (size_t jj=0; jj<4; ++jj) {
             mgr.addTask( [ii, jj, &mm](const TaskResult& ret) {
@@ -181,8 +216,8 @@ int mixed_test(size_t num_threads) {
         TestSuite::sleep_ms(100);
     }
 
+    // Shutdown thread pool.
     mgr.shutdown();
-
     return 0;
 }
 
@@ -190,12 +225,15 @@ int unfinished_tasks_test(size_t num_threads) {
     ThreadPoolOptions opt;
     opt.numInitialThreads = num_threads;
 
+    // Initialize thread pool.
     ThreadPoolMgr mgr;
     mgr.init(opt);
 
     TestSuite::_msgt("begin\n");
 
     std::mutex mm;
+
+    // 15 async tasks.
     for (size_t ii=0; ii<15; ++ii) {
         mgr.addTask( [ii, &mm](const TaskResult& ret) {
             std::lock_guard<std::mutex> l(mm);
@@ -207,6 +245,7 @@ int unfinished_tasks_test(size_t num_threads) {
         } );
     }
 
+    // Recurring timer whose interval is 20 ms.
     mgr.addTask( [](const TaskResult& ret) {
                      TestSuite::_msgt("[%02zx] recurring 20 ms, result %d\n",
                                       tid_simple(), ret);
@@ -214,17 +253,20 @@ int unfinished_tasks_test(size_t num_threads) {
                  20*1000,
                  TaskType::RECURRING );
 
+    // One-time timer whose interval is 500 ms.
     mgr.addTask( [](const TaskResult& ret) {
                      TestSuite::_msgt("[%02zx] one-time 500 ms, result %d\n",
                                       tid_simple(), ret);
                  },
                  500000 );
 
+    // Wait 50 ms.
     TestSuite::sleep_ms(50);
 
+    // Shutdown thread pool.
+    // Unfinished tasks will be fired with `CANCELED` result code.
     TestSuite::_msgt("shutdown thread pool\n");
     mgr.shutdown();
-
     return 0;
 }
 

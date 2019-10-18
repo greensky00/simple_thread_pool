@@ -20,5 +20,34 @@ build$ ./basic_test
 
 How to Use
 ----------
-* Include [`src/simple_thread_pool.h`](src/simple_thread_pool.h) in your source code.
-* Please refer to [`tests/basic_test.cc`](tests/basic_test.cc).
+Include [`src/simple_thread_pool.h`](src/simple_thread_pool.h) in your source code.
+
+```C++
+using namespace simple_thread_pool;
+
+// Initialize a pool with 4 threads.
+ThreadPoolOptions opt;
+opt.numInitialThreads = 4;
+
+ThreadPoolMgr mgr;
+mgr.init(opt);
+
+// Print hello world asynchronously.
+mgr.addTask( [](const TaskResult& ret) { printf("hello world!\n"); } );
+
+// Timer. Print hello world after 1 second (1,000,000 microseconds).
+mgr.addTask( [](const TaskResult& ret) { printf("hello world!!\n"); },
+             1000000 );
+
+// Recurring timer. Print hello world for every 2 second.
+mgr.addTask( [](const TaskResult& ret) { printf("hello world!!!\n"); },
+             2000000,
+             TaskType::RECURRING );
+
+// ...
+
+// Shutdown.
+mgr.shutdown();
+```
+
+Please refer to [`tests/basic_test.cc`](tests/basic_test.cc).
