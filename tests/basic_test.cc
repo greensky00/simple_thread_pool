@@ -221,9 +221,16 @@ int mixed_test(size_t num_threads) {
     return 0;
 }
 
-int unfinished_tasks_test(size_t num_threads) {
+DEFINE_PARAMS_2( unfinished_tasks_test_params,
+                 bool, cancel_flag, ({false, true}),
+                 size_t, num_threads, ({0, 1, 4}) );
+
+int unfinished_tasks_test(PARAM_BASE) {
+    GET_PARAMS(unfinished_tasks_test_params);
+
     ThreadPoolOptions opt;
-    opt.numInitialThreads = num_threads;
+    opt.numInitialThreads = unfinished_tasks_test_params->num_threads;
+    opt.invokeCanceledTask = unfinished_tasks_test_params->cancel_flag;
 
     // Initialize thread pool.
     ThreadPoolMgr mgr;
@@ -264,7 +271,8 @@ int unfinished_tasks_test(size_t num_threads) {
     TestSuite::sleep_ms(50);
 
     // Shutdown thread pool.
-    // Unfinished tasks will be fired with `CANCELED` result code.
+    // If `opt.invokeCanceledTask = true`, unfinished tasks will be fired
+    // with `CANCELED` result code. Otherwise, they will be just purged.
     TestSuite::_msgt("shutdown thread pool\n");
     mgr.shutdown();
     return 0;
@@ -298,9 +306,10 @@ int main(int argc, char** argv) {
                  mixed_test,
                  TestRange<size_t>( {0, 1, 4} ) );
 
+    SET_PARAMS(unfinished_tasks_test_params);
     test.doTest( "unfinished tasks test",
                  unfinished_tasks_test,
-                 TestRange<size_t>( {0, 1, 4} ) );
+                 unfinished_tasks_test_params );
 
     return 0;
 }

@@ -152,11 +152,13 @@ class ThreadPoolMgrBase {
 public:
     ThreadPoolMgrBase() {}
 
-    virtual bool isStopped() = 0;
+    virtual bool isStopped() const = 0;
 
     virtual void invoke() = 0;
 
     virtual void returnThread(const std::shared_ptr<ThreadHandle>& t_handle) = 0;
+
+    virtual bool invokeCanceledTask() const = 0;
 };
 
 class TaskHandle {
@@ -230,7 +232,13 @@ public:
         if (type == ONE_TIME) {
             TaskStatus exp = WAITING;
             TaskStatus desired = DONE;
-            return status.compare_exchange_strong(exp, desired);
+            if (status.compare_exchange_strong(exp, desired)) {
+                if (mgr->invokeCanceledTask()) {
+                    handler( TaskResult(TaskResult::CANCELED) );
+                }
+                return true;
+            }
+            return false;
         }
         status = DONE;
         return true;
@@ -365,6 +373,7 @@ struct ThreadPoolOptions {
     ThreadPoolOptions()
         : numInitialThreads(4)
         , busyWaitingIntervalUs(100)
+        , invokeCanceledTask(false)
         {}
 
     // Number of threads in the pool.
@@ -376,6 +385,9 @@ struct ThreadPoolOptions {
     // Higher number will provide better accuracy, but
     // will consume more CPU.
     size_t busyWaitingIntervalUs;
+
+    // If `true`, will invoke task handler with `CANCELED` result code.
+    bool invokeCanceledTask;
 };
 
 class ThreadPoolMgr : public ThreadPoolMgrBase {
@@ -448,7 +460,7 @@ public:
         TaskResult tr(TaskResult::CANCELED);
         for (auto& entry: tasks_to_cancel) {
             std::shared_ptr<TaskHandle>& tt = entry;
-            tt->execute(tr);
+            tt->cancel();
         }
     }
 
@@ -485,7 +497,7 @@ public:
      *
      * @return `true` if stopped.
      */
-    bool isStopped() { return stopSignal; }
+    bool isStopped() const { return stopSignal; }
 
     /**
      * Manually invoke the main coordination loop.
@@ -496,6 +508,10 @@ private:
     void returnThread(const std::shared_ptr<ThreadHandle>& t_handle) {
         std::lock_guard<std::mutex> l(idleThreadsLock);
         idleThreads.push_front( t_handle );
+    }
+
+    bool invokeCanceledTask() const {
+        return myOpt.invokeCanceledTask;
     }
 
     void loop() {
