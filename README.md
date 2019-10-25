@@ -22,6 +22,7 @@ How to Use
 ----------
 Include [`src/simple_thread_pool.h`](src/simple_thread_pool.h) in your source code.
 
+[`examples/example.cc`](examples/example.cc):
 ```C++
 using namespace simple_thread_pool;
 
@@ -44,10 +45,11 @@ mgr.addTask( [](const TaskResult& ret) { printf("hello world!!!\n"); },
              2000000,
              TaskType::RECURRING );
 
-// ...
+// Within 3 seconds, all above events will be fired.
+std::this_thread::sleep_for( std::chrono::seconds(3) );
 
 // Shutdown.
 mgr.shutdown();
 ```
 
-Please refer to [`tests/basic_test.cc`](tests/basic_test.cc).
+Please refer to [`tests/basic_test.cc`](tests/basic_test.cc) for more examples.

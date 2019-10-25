@@ -5,7 +5,7 @@
  * https://github.com/greensky00
  *
  * Simple Thread Pool
- * Version: 0.1.0
+ * Version: 0.1.1
  *
  * Permission is hereby granted, free of charge, to any person
  * obtaining a copy of this software and associated documentation
@@ -325,10 +325,10 @@ public:
     }
 
     void loop() {
-    #ifdef __linux__
+#ifdef __linux__
         std::string thread_name = "stp_" + std::to_string(myId);
         pthread_setname_np(pthread_self(), thread_name.c_str());
-    #endif
+#endif
         while (!mgr->isStopped()) {
             eaLoop.wait();
             eaLoop.reset();
@@ -515,6 +515,9 @@ private:
     }
 
     void loop() {
+#ifdef __linux__
+        pthread_setname_np(pthread_self(), "stp_coord");
+#endif
         const uint64_t MAX_SLEEP_US = 1000000;
         uint64_t next_sleep_us = MAX_SLEEP_US;
 

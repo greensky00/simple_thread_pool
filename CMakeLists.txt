@@ -14,6 +14,7 @@ message(STATUS "Build type: " ${CMAKE_BUILD_TYPE})
 
 set(ROOT_SRC ${PROJECT_SOURCE_DIR}/src)
 set(TEST_DIR ${PROJECT_SOURCE_DIR}/tests)
+set(EXAMPLE_DIR ${PROJECT_SOURCE_DIR}/examples)
 
 set(LIBDL dl)
 
@@ -66,10 +67,17 @@ endif()
 
 
 
-# === Example ===
+# === Tests ===
 
 set(BASIC_TEST
     ${TEST_DIR}/basic_test.cc
     ${TEST_DIR}/verify_multi_include.cc)
 add_executable(basic_test ${BASIC_TEST})
+
+
+# === Examples ===
+
+set(BASIC_EXAMPLE
+    ${EXAMPLE_DIR}/example.cc)
+add_executable(example ${BASIC_EXAMPLE})
 
