@@ -5,7 +5,7 @@
  * https://github.com/greensky00
  *
  * Simple Thread Pool
- * Version: 0.1.1
+ * Version: 0.1.2
  *
  * Permission is hereby granted, free of charge, to any person
  * obtaining a copy of this software and associated documentation
@@ -38,6 +38,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 
 namespace simple_thread_pool {
 
@@ -144,6 +145,8 @@ private:
 
 using TaskHandler = std::function< void(const TaskResult&) >;
 
+struct ThreadPoolOptions;
+class TaskHandle;
 class ThreadHandle;
 class ThreadPoolMgrBase {
     friend class TaskHandle;
@@ -159,6 +162,15 @@ public:
     virtual void returnThread(const std::shared_ptr<ThreadHandle>& t_handle) = 0;
 
     virtual bool invokeCanceledTask() const = 0;
+
+    virtual std::shared_ptr<TaskHandle>
+        getTaskToRun(uint64_t* next_sleep_hint_us_inout = nullptr) = 0;
+
+    virtual bool isActiveWorkerMode() const = 0;
+
+    virtual void registerThreadId() = 0;
+
+    virtual void checkThreadAndInvoke() = 0;
 };
 
 class TaskHandle {
@@ -258,7 +270,7 @@ public:
                 intervalUs = new_interval_us;
             }
         }
-        mgr->invoke();
+        mgr->checkThreadAndInvoke();
     }
 
     /**
@@ -329,9 +341,14 @@ public:
         std::string thread_name = "stp_" + std::to_string(myId);
         pthread_setname_np(pthread_self(), thread_name.c_str());
 #endif
+        mgr->registerThreadId();
+
+        bool need_to_sleep = true;
         while (!mgr->isStopped()) {
-            eaLoop.wait();
-            eaLoop.reset();
+            if (need_to_sleep) {
+                eaLoop.wait();
+                eaLoop.reset();
+            }
             if (mgr->isStopped()) break;
 
             if (assignedTask) {
@@ -339,8 +356,19 @@ public:
             }
             assignedTask.reset();
 
+            if (mgr->isActiveWorkerMode()) {
+                // Active mode, find the next task to run.
+                std::shared_ptr<TaskHandle> task_to_run = mgr->getTaskToRun();
+                if (task_to_run) {
+                    assignedTask = task_to_run;
+                    need_to_sleep = false;
+                    continue;
+                }
+            }
+
             mgr->returnThread(myself);
             mgr->invoke();
+            need_to_sleep = true;
         }
     }
 
@@ -374,6 +402,7 @@ struct ThreadPoolOptions {
         : numInitialThreads(4)
         , busyWaitingIntervalUs(100)
         , invokeCanceledTask(false)
+        , activeWorkerMode(true)
         {}
 
     // Number of threads in the pool.
@@ -388,6 +417,13 @@ struct ThreadPoolOptions {
 
     // If `true`, will invoke task handler with `CANCELED` result code.
     bool invokeCanceledTask;
+
+    // If `true`, once a worker thread finishes its current task,
+    // it does not sleep but actively finds if there is any pending tasks,
+    // and runs it immediately.
+    // It will help to save the overall CPU utilization by avoiding wasteful
+    // frequent sleeping and awakening.
+    bool activeWorkerMode;
 };
 
 class ThreadPoolMgr : public ThreadPoolMgrBase {
@@ -432,7 +468,7 @@ public:
     void shutdown() {
         stopSignal = true;
         if (loopThread && loopThread->joinable()) {
-            eaLoop.invoke();
+            invoke();
             loopThread->join();
         }
         loopThread.reset();
@@ -487,8 +523,8 @@ public:
             std::lock_guard<std::mutex> l(normalTasksLock);
             normalTasks.push_back(new_task);
         }
-        eaLoop.invoke();
 
+        checkThreadAndInvoke();
         return new_task;
     }
 
@@ -504,7 +540,111 @@ public:
      */
     void invoke() { eaLoop.invoke(); }
 
+    /**
+     * Get a task to run.
+     *
+     * @param next_sleep_hint_us_inout
+     *        If given, this function will return the next sleep time for
+     *        manager's event loop.
+     * @return Task handle. `nullptr` if no task is awaiting.
+     */
+    std::shared_ptr<TaskHandle> getTaskToRun
+                                (uint64_t* next_sleep_hint_us_inout = nullptr)
+    {
+        // Check timer task first (higher priority).
+        std::shared_ptr<TaskHandle> task_to_run = nullptr;
+        {   std::lock_guard<std::mutex> l(timedTasksLock);
+            auto entry = timedTasks.begin();
+            while (entry != timedTasks.end()) {
+                std::shared_ptr<TaskHandle>& tt = *entry;
+                uint64_t remaining_us = 0;
+                if (tt->timeToFire(remaining_us)) {
+                    task_to_run = tt;
+                    if ( task_to_run->isOneTime() ||
+                         task_to_run->isDone() ) {
+                        entry = timedTasks.erase(entry);
+                    } else {
+                        task_to_run->reschedule();
+                    }
+
+                    if (task_to_run->isDone()) task_to_run.reset();
+                    else break;
+                }
+                if (!task_to_run) {
+                    entry++;
+                    // Adjust next sleep time.
+                    if (next_sleep_hint_us_inout) {
+                        *next_sleep_hint_us_inout = std::min(*next_sleep_hint_us_inout,
+                                                             remaining_us);
+                        *next_sleep_hint_us_inout = std::min(*next_sleep_hint_us_inout,
+                                                             MAX_SLEEP_US);
+                    }
+                }
+            }
+        }
+
+        if (!task_to_run) {
+            // If there is no timer task to be fired for now,
+            // pick a normal task.
+            std::lock_guard<std::mutex> l(normalTasksLock);
+            auto entry = normalTasks.begin();
+            if (entry != normalTasks.end()) {
+                task_to_run = *entry;
+                normalTasks.erase(entry);
+            }
+
+            if (normalTasks.size()) {
+                // Still have pending task(s). Do not sleep.
+                if (next_sleep_hint_us_inout) {
+                    *next_sleep_hint_us_inout = 0;
+                }
+            }
+        }
+        return task_to_run;
+    }
+
+    bool isActiveWorkerMode() const { return myOpt.activeWorkerMode; }
+
+    void registerThreadId() {
+        std::thread::id tid = std::this_thread::get_id();
+
+        std::lock_guard<std::mutex> l(threadIdsLock);
+        threadIds.insert(tid);
+    }
+
+    void checkThreadAndInvoke() {
+        // `true` if `is_this_thread_worker` has valid value.
+        thread_local bool this_thread_is_identified = false;
+
+        // `true` if this thread is the worker of the thread pool.
+        thread_local bool this_thread_is_worker = false;
+
+        if (!this_thread_is_identified) {
+            std::thread::id tid = std::this_thread::get_id();
+
+            std::lock_guard<std::mutex> l(threadIdsLock);
+            auto entry = threadIds.find(tid);
+            if (entry != threadIds.end()) {
+                this_thread_is_worker = true;
+            }
+            this_thread_is_identified = true;
+        }
+
+        if ( this_thread_is_identified &&
+             this_thread_is_worker &&
+             myOpt.activeWorkerMode ) {
+            // This is worker thread and in active mode.
+            // We don't need to invoke thread loop,
+            // as the worker's loop will serve the next task immediately.
+        } else {
+            // Otherwise, invoke manager's loop.
+            invoke();
+        }
+    }
+
 private:
+    const uint64_t MAX_SLEEP_US = 1000000;
+
     void returnThread(const std::shared_ptr<ThreadHandle>& t_handle) {
         std::lock_guard<std::mutex> l(idleThreadsLock);
         idleThreads.push_front( t_handle );
@@ -518,7 +658,6 @@ private:
 #ifdef __linux__
         pthread_setname_np(pthread_self(), "stp_coord");
 #endif
-        const uint64_t MAX_SLEEP_US = 1000000;
         uint64_t next_sleep_us = MAX_SLEEP_US;
 
         while (!stopSignal) {
@@ -552,48 +691,7 @@ private:
             // this loop thread will do execution.
 
             // Check timer task first (higher priority).
-            std::shared_ptr<TaskHandle> task_to_run = nullptr;
-            {   std::lock_guard<std::mutex> l(timedTasksLock);
-                auto entry = timedTasks.begin();
-                while (entry != timedTasks.end()) {
-                    std::shared_ptr<TaskHandle>& tt = *entry;
-                    uint64_t remaining_us = 0;
-                    if (tt->timeToFire(remaining_us)) {
-                        task_to_run = tt;
-                        if ( task_to_run->isOneTime() ||
-                             task_to_run->isDone() ) {
-                            entry = timedTasks.erase(entry);
-                        } else {
-                            task_to_run->reschedule();
-                        }
-
-                        if (task_to_run->isDone()) task_to_run.reset();
-                        else break;
-                    }
-                    if (!task_to_run) {
-                        entry++;
-                        // Adjust next sleep time.
-                        next_sleep_us = std::min(next_sleep_us, remaining_us);
-                        next_sleep_us = std::min(next_sleep_us, MAX_SLEEP_US);
-                    }
-                }
-            }
-
-            if (!task_to_run) {
-                // If there is no timer task to be fired for now,
-                // pick a normal task.
-                std::lock_guard<std::mutex> l(normalTasksLock);
-                auto entry = normalTasks.begin();
-                if (entry != normalTasks.end()) {
-                    task_to_run = *entry;
-                    normalTasks.erase(entry);
-                }
-
-                if (normalTasks.size()) {
-                    // Still have pending task(s). Do not sleep.
-                    next_sleep_us = 0;
-                }
-            }
+            std::shared_ptr<TaskHandle> task_to_run = getTaskToRun(&next_sleep_us);
 
             if (!task_to_run) {
                 // No task to run, skip.
@@ -637,6 +735,10 @@ private:
     // List of idle threads.
     std::list< std::shared_ptr<ThreadHandle> > idleThreads;
     std::mutex idleThreadsLock;
+
+    // Set of thread IDs.
+    std::unordered_set<std::thread::id> threadIds;
+    std::mutex threadIdsLock;
 };
 
 };

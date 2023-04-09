@@ -2,6 +2,8 @@
 
 #include "test_common.h"
 
+#include <set>
+
 using namespace simple_thread_pool;
 
 size_t tid_simple() {
@@ -100,6 +102,79 @@ int relay_test(size_t num_threads) {
 
     // Wait 2 seconds.
     TestSuite::sleep_sec(2);
+
+    // Shutdown thread pool.
+    mgr.shutdown();
+    return 0;
+}
+
+struct FastRelayCtx {
+    std::set<size_t> storage;
+    bool asyncScheduleNext = true;
+    EventAwaiter ea;
+};
+
+void fast_relay_func(FastRelayCtx* ctx, ThreadPoolMgr* mgr, const TaskResult& ret) {
+    size_t num_entries = ctx->storage.size();
+    if (num_entries < 1000000) {
+        std::hash<size_t> h_func;
+        size_t h_val = h_func(num_entries);
+        ctx->storage.insert(h_val);
+
+        if (num_entries % 100000 == 0) {
+            TestSuite::_msgt("[%02zx] inserted %zu\n", tid_simple(), num_entries);
+        }
+
+        if (ctx->asyncScheduleNext) {
+            // Register the next immediate task.
+            mgr->addTask( std::bind(fast_relay_func,
+                                    ctx,
+                                    mgr,
+                                    std::placeholders::_1) );
+        }
+    } else {
+        ctx->ea.invoke();
+    }
+}
+
+/**
+ * @param mode
+ *        0: sync mode.
+ *        1: async with active worker = false.
+ *        2: async with active worker = true.
+ */
+int fast_relay_test(int mode) {
+    ThreadPoolOptions opt;
+    opt.numInitialThreads = 2;
+    if (mode == 1) {
+        opt.activeWorkerMode = false;
+    } else if (mode == 2) {
+        opt.activeWorkerMode = true;
+    }
+
+    // Initialize thread pool.
+    ThreadPoolMgr mgr;
+    mgr.init(opt);
+
+    TestSuite::_msgt("begin\n");
+    TestSuite::Timer tt;
+
+    FastRelayCtx relay_ctx;
+    if (mode == 0) {
+        relay_ctx.asyncScheduleNext = false;
+        for (size_t ii = 0; ii < 1000000; ++ii) {
+            fast_relay_func(&relay_ctx, &mgr, TaskResult());
+        }
+    } else {
+        // Fire timer task.
+        fast_relay_func(&relay_ctx, &mgr, TaskResult());
+        // Wait 3 seconds.
+        relay_ctx.ea.wait_ms(3000);
+    }
+
+    uint64_t elapsed_us = tt.getTimeUs();
+    TestSuite::_msgt("%.1f executions/s",
+                     relay_ctx.storage.size() * 1000000.0 / elapsed_us);
 
     // Shutdown thread pool.
     mgr.shutdown();
@@ -293,6 +368,10 @@ int main(int argc, char** argv) {
     test.doTest( "relay test",
                  relay_test,
                  TestRange<size_t>( {0, 1, 2} ) );
+
+    test.doTest( "fast relay test",
+                 fast_relay_test,
+                 TestRange<int>( {0, 1, 2} ) );
 
     test.doTest( "reschedule one time test",
                  reschedule_one_time_test,
