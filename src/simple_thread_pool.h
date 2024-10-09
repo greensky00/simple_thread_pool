@@ -5,7 +5,7 @@
  * https://github.com/greensky00
  *
  * Simple Thread Pool
- * Version: 0.1.2
+ * Version: 0.1.3
  *
  * Permission is hereby granted, free of charge, to any person
  * obtaining a copy of this software and associated documentation
