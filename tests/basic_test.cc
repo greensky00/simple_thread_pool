@@ -4,10 +4,18 @@
 
 #include <set>
 
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 using namespace simple_thread_pool;
 
 size_t tid_simple() {
+#ifdef __linux__
+    return (uint32_t)syscall(SYS_gettid);
+#else
     return std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xff;
+#endif
 }
 
 int basic_test(size_t num_threads) {
@@ -350,6 +358,7 @@ int unfinished_tasks_test(PARAM_BASE) {
     // with `CANCELED` result code. Otherwise, they will be just purged.
     TestSuite::_msgt("shutdown thread pool\n");
     mgr.shutdown();
+
     return 0;
 }
 

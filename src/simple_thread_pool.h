@@ -39,6 +39,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace simple_thread_pool {
 
@@ -159,7 +160,7 @@ public:
 
     virtual void invoke() = 0;
 
-    virtual void returnThread(const std::shared_ptr<ThreadHandle>& t_handle) = 0;
+    virtual bool returnThread(const std::shared_ptr<ThreadHandle>& t_handle) = 0;
 
     virtual bool invokeCanceledTask() const = 0;
 
@@ -168,7 +169,7 @@ public:
 
     virtual bool isActiveWorkerMode() const = 0;
 
-    virtual void registerThreadId() = 0;
+    virtual void registerThreadId(const std::shared_ptr<ThreadHandle>& t_handle) = 0;
 
     virtual void checkThreadAndInvoke() = 0;
 };
@@ -341,41 +342,71 @@ public:
         std::string thread_name = "stp_" + std::to_string(myId);
         pthread_setname_np(pthread_self(), thread_name.c_str());
 #endif
-        mgr->registerThreadId();
+        mgr->registerThreadId(myself);
 
         bool need_to_sleep = true;
         while (!mgr->isStopped()) {
             if (need_to_sleep) {
                 eaLoop.wait();
+                // After spurious wake-up, although `assign()` (hence `eaLoop.invoke()`)
+                // is called here, that's fine. This thread will do the task,
+                // and then sleep again.
                 eaLoop.reset();
             }
             if (mgr->isStopped()) break;
 
-            if (assignedTask) {
-                assignedTask->execute(TaskResult());
+            // NOTE:
+            //   In case of spurious wake-up, `assigned_task` may be `nullptr`.
+            //   If it is not `nullptr`, that means `assign()` was called in between.
+            //   Then it can just execute it.
+            std::shared_ptr<TaskHandle> assigned_task = nullptr;
+            {
+                std::lock_guard<std::mutex> l(assignedTaskLock);
+                assigned_task = assignedTask;
+                assignedTask.reset();
             }
-            assignedTask.reset();
+            if (assigned_task) {
+                assigned_task->execute(TaskResult());
 
-            if (mgr->isActiveWorkerMode()) {
-                // Active mode, find the next task to run.
-                std::shared_ptr<TaskHandle> task_to_run = mgr->getTaskToRun();
-                if (task_to_run) {
-                    assignedTask = task_to_run;
-                    need_to_sleep = false;
-                    continue;
+                if (mgr->isActiveWorkerMode()) {
+                    // Active mode, find the next task to run.
+
+                    // WARNING:
+                    //   In case of spurious wake-up, if `assign()` was called
+                    //   rigth before here, the task in `assignedTask` can be lost
+                    //   by the below code.
+                    //
+                    //   Hence, this `if` should always be running when `assigned_task`
+                    //   is not `nullptr` (i.e., `ThreadPoolMgr` already removed it
+                    //   from the idle list).
+                    std::shared_ptr<TaskHandle> task_to_run = mgr->getTaskToRun();
+                    if (task_to_run) {
+                        assign(task_to_run);
+                        need_to_sleep = false;
+                        continue;
+                    }
                 }
             }
 
-            mgr->returnThread(myself);
-            mgr->invoke();
+            bool returned = mgr->returnThread(myself);
+            if (returned) {
+                mgr->invoke();
+            }
+            // If `returned` is false, that means it was a spurious wake-up.
             need_to_sleep = true;
         }
+
+        // To make `shutdown()` work properly.
+        myself.reset();
     }
 
     void assign(const std::shared_ptr<TaskHandle>& handle) {
+        std::lock_guard<std::mutex> l(assignedTaskLock);
         assignedTask = handle;
         eaLoop.invoke();
     }
+
+    size_t getId() const { return myId; }
 
 private:
     // Thread ID.
@@ -392,6 +423,9 @@ private:
 
     // Assigned task to execute.
     std::shared_ptr< TaskHandle > assignedTask;
+
+    // Lock for `assignedTask`.
+    std::mutex assignedTaskLock;
 
     // Condition variable for thread loop.
     EventAwaiter eaLoop;
@@ -456,7 +490,7 @@ public:
         {   std::lock_guard<std::mutex> l(idleThreadsLock);
             for (size_t ii = 0; ii < myOpt.numInitialThreads; ++ii) {
                 std::shared_ptr<ThreadHandle> t_handle( new ThreadHandle(this, ii) );
-                idleThreads.push_back(t_handle);
+                idleThreads.insert({ii, t_handle});
                 t_handle->init(t_handle);
             }
         }
@@ -473,24 +507,19 @@ public:
         }
         loopThread.reset();
 
-        do {
-            std::shared_ptr<ThreadHandle> t_handle_to_free = nullptr;
-            {   std::lock_guard<std::mutex> l(idleThreadsLock);
-                auto entry = idleThreads.begin();
-                if (entry == idleThreads.end()) break;
-                t_handle_to_free = *entry;
-                idleThreads.erase(entry);
-            }
-            t_handle_to_free->shutdown();
-        } while (true);
-
         std::list< std::shared_ptr<TaskHandle> > tasks_to_cancel;
-        {   std::lock_guard<std::mutex> l(timedTasksLock);
-            for (auto& entry: timedTasks) tasks_to_cancel.push_back(entry);
+        {
+            std::lock_guard<std::mutex> l(timedTasksLock);
+            for (auto& entry: timedTasks) {
+                tasks_to_cancel.push_back(entry);
+            }
             timedTasks.clear();
         }
-        {   std::lock_guard<std::mutex> l(normalTasksLock);
-            for (auto& entry: normalTasks) tasks_to_cancel.push_back(entry);
+        {
+            std::lock_guard<std::mutex> l(normalTasksLock);
+            for (auto& entry: normalTasks) {
+                tasks_to_cancel.push_back(entry);
+            }
             normalTasks.clear();
         }
         TaskResult tr(TaskResult::CANCELED);
@@ -498,6 +527,18 @@ public:
             std::shared_ptr<TaskHandle>& tt = entry;
             tt->cancel();
         }
+
+        do {
+            std::shared_ptr<ThreadHandle> t_handle_to_free = nullptr;
+            {
+                std::lock_guard<std::mutex> l(threadIdsLock);
+                auto entry = threadIds.begin();
+                if (entry == threadIds.end()) break;
+                t_handle_to_free = entry->second;
+                threadIds.erase(entry);
+            }
+            t_handle_to_free->shutdown();
+        } while (true);
     }
 
     /**
@@ -605,11 +646,11 @@ public:
 
     bool isActiveWorkerMode() const { return myOpt.activeWorkerMode; }
 
-    void registerThreadId() {
+    void registerThreadId(const std::shared_ptr<ThreadHandle>& t_handle) {
         std::thread::id tid = std::this_thread::get_id();
 
         std::lock_guard<std::mutex> l(threadIdsLock);
-        threadIds.insert(tid);
+        threadIds.insert({tid, t_handle});
     }
 
     void checkThreadAndInvoke() {
@@ -645,9 +686,25 @@ public:
 private:
     const uint64_t MAX_SLEEP_US = 1000000;
 
-    void returnThread(const std::shared_ptr<ThreadHandle>& t_handle) {
+    bool returnThread(const std::shared_ptr<ThreadHandle>& t_handle) {
         std::lock_guard<std::mutex> l(idleThreadsLock);
-        idleThreads.push_front( t_handle );
+        auto entry = idleThreads.find(t_handle->getId());
+        if (entry != idleThreads.end()) {
+            return false;
+        }
+        idleThreads.insert({t_handle->getId(), t_handle});
+        return true;
+    }
+
+    std::shared_ptr<ThreadHandle> popThread() {
+        std::lock_guard<std::mutex> l(idleThreadsLock);
+        auto entry = idleThreads.begin();
+        if (entry == idleThreads.end()) {
+            return nullptr;
+        }
+        std::shared_ptr<ThreadHandle> t_handle = entry->second;
+        idleThreads.erase(entry);
+        return t_handle;
     }
 
     bool invokeCanceledTask() const {
@@ -675,13 +732,7 @@ private:
 
             if (myOpt.numInitialThreads) {
                 // Thread pool exists, pick an idle thread.
-                {   std::lock_guard<std::mutex> l(idleThreadsLock);
-                    auto entry = idleThreads.begin();
-                    if (entry != idleThreads.end()) {
-                        thread_to_assign = *entry;
-                        idleThreads.erase(entry);
-                    }
-                }
+                thread_to_assign = popThread();
                 if (!thread_to_assign) {
                     // All threads are busy, skip.
                     continue;
@@ -696,8 +747,8 @@ private:
             if (!task_to_run) {
                 // No task to run, skip.
                 if (thread_to_assign) {
-                    std::lock_guard<std::mutex> l(idleThreadsLock);
-                    idleThreads.push_front(thread_to_assign);
+                    // Return the thread to idle list.
+                    returnThread(thread_to_assign);
                 }
                 continue;
             }
@@ -732,12 +783,12 @@ private:
     std::list< std::shared_ptr<TaskHandle> > normalTasks;
     std::mutex normalTasksLock;
 
-    // List of idle threads.
-    std::list< std::shared_ptr<ThreadHandle> > idleThreads;
+    // Currently idle threads. Key: thread handle ID, value: thread handle.
+    std::unordered_map<size_t, std::shared_ptr<ThreadHandle>> idleThreads;
     std::mutex idleThreadsLock;
 
-    // Set of thread IDs.
-    std::unordered_set<std::thread::id> threadIds;
+    // Set of thread IDs and its handles.
+    std::unordered_map<std::thread::id, std::shared_ptr<ThreadHandle>> threadIds;
     std::mutex threadIdsLock;
 };
 
